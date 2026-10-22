@@ -1,0 +1,130 @@
+--- a/harness_gateway/channels/discord.py
++++ b/harness_gateway/channels/discord.py
+@@ -147,6 +147,7 @@
+         self._client.event(self.on_resumed)
+         self._client.event(self.on_disconnect)
+         self._client.event(self.on_message)
++        self._client.event(self.on_interaction)  # octop-patch: application-command support
+         self._client_task = asyncio.create_task(self._run_client(), name=f"discord-{self.channel_id}")
+         ready_task = asyncio.create_task(self._ready.wait())
+         try:
+@@ -254,6 +255,119 @@
+             return
+         self.enqueue(msg)
+ 
++    # octop-patch: discord-interaction-support v2
++    async def on_interaction(self, interaction: Any) -> None:
++        """Treat a Discord application command as the equivalent slash text.
++
++        Octop's slash commands are text-level: the gateway intercepts messages
++        that start with "/" and routes them to the SlashDispatcher. Discord
++        delivers a registered application command as an *interaction* instead of
++        a message, which this adapter would otherwise drop. Translating the
++        interaction back into its text form keeps exactly one execution path
++        (ctx building, thread binding, dispatcher, reply) instead of a second
++        one that would drift.
++        """
++        import discord
++
++        # discord.py renamed this member: 2.3 and earlier call it `command`,
++        # 2.4+ call it `application_command`. Both mean a chat-input command.
++        command_type = getattr(discord.InteractionType, "application_command", None) or getattr(
++            discord.InteractionType, "command", None
++        )
++        if getattr(interaction, "type", None) != command_type:
++            return
++        data = getattr(interaction, "data", None) or {}
++        name = str(data.get("name") or "").strip().lower()
++        channel_id = str(getattr(interaction, "channel_id", "") or "")
++        user = getattr(interaction, "user", None)
++        user_id = str(getattr(user, "id", "") or "")
++        if not name or not channel_id or not user_id:
++            return
++        guild_id = getattr(interaction, "guild_id", None)
++        parent_id = str(getattr(getattr(interaction, "channel", None), "parent_id", None) or "")
++        # Same access rules as on_message: DMs need the allowlist, guilds need
++        # an allowed channel unless allow_all_channels is set.
++        if guild_id is None:
++            if user_id not in self._config.allowed_user_ids:
++                return
++        elif not (
++            self._config.allow_all_channels
++            or channel_id in self._config.allowed_channel_ids
++            or parent_id in self._config.allowed_channel_ids
++        ):
++            return
++        text = self._interaction_text(name, data.get("options") or [])
++        if not text:
++            return
++        self.enqueue(
++            self._interaction_inbound(
++                interaction, text, channel_id=channel_id, user_id=user_id, guild_id=guild_id
++            )
++        )
++        # Discord requires a response within 3s. The command result itself
++        # arrives as a normal channel message.
++        with contextlib.suppress(Exception):
++            await interaction.response.defer(ephemeral=True)
++
++    @staticmethod
++    def _interaction_text(name: str, options: Any) -> str:
++        """Render an application command's options back into its text form."""
++        values: list[str] = []
++        for opt in options or []:
++            value = getattr(opt, "value", None)
++            if value is None and isinstance(opt, dict):
++                value = opt.get("value")
++            if value is None:
++                continue
++            values.append(str(value))
++        return ("/" + name + " " + " ".join(values)).strip()
++
++    def _interaction_inbound(
++        self,
++        interaction: Any,
++        text: str,
++        *,
++        channel_id: str,
++        user_id: str,
++        guild_id: Any,
++    ) -> InboundMessage:
++        is_group = guild_id is not None
++        user = getattr(interaction, "user", None)
++        channel = getattr(interaction, "channel", None)
++        sender_name = getattr(user, "display_name", "") or user_id
++        metadata: dict[str, Any] = {
++            "chat_id": channel_id,
++            "channel_id_native": channel_id,
++            "chat_type": "group" if is_group else "dm",
++            "sender_id": user_id,
++            "sender_name": sender_name,
++            "message_id": str(getattr(interaction, "id", "")),
++            # An application command is an explicit invocation, so the group
++            # mention gate must not swallow it.
++            "bot_mentioned": True,
++        }
++        if is_group:
++            metadata["guild_id"] = str(guild_id)
++        parent_id = str(getattr(channel, "parent_id", None) or "")
++        if parent_id:
++            metadata["parent_channel_id"] = parent_id
++        created_at = getattr(interaction, "created_at", None)
++        return InboundMessage(
++            channel_id=self.channel_id,
++            channel_type=self.channel_type,
++            tenant_id=self.tenant_id,
++            channel_subject=ChannelSubject(
++                subject_id=channel_id if is_group else user_id,
++                chat_type="group" if is_group else "dm",
++                display_name=getattr(channel, "name", "") if is_group else sender_name,
++                metadata=dict(metadata),
++            ),
++            channel_session_id=self._connection_session or f"{self.channel_id}-unconnected",
++            content=[TextContent(text=text)],
++            metadata=metadata,
++            timestamp=created_at.timestamp() if created_at else 0.0,
++        )
++
+     def parse_inbound(self, raw_payload: Any) -> InboundMessage:
+         if isinstance(raw_payload, InboundMessage):
+             return raw_payload
